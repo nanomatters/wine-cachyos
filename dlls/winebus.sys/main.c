@@ -119,17 +119,19 @@ static void unix_device_remove(DEVICE_OBJECT *device)
 {
     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
     struct device_remove_params params = {.device = ext->unix_device};
-    winebus_call(device_remove, &params);
+    if (params.device) winebus_call(device_remove, &params);
+    ext->unix_device = 0;
 }
 
 static NTSTATUS unix_device_start(DEVICE_OBJECT *device)
 {
     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
     struct device_start_params params = {.device = ext->unix_device};
-    return winebus_call(device_start, &params);
+    return params.device ? winebus_call(device_start, &params) : STATUS_DEVICE_NOT_CONNECTED;
 }
 
-static void unix_device_set_output_report(DEVICE_OBJECT *device, HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
+/* Called with the device critical section held, including across the Unix call. */
+static void unix_device_report(DEVICE_OBJECT *device, unsigned int code, HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
 {
     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
     struct device_report_params params =
@@ -138,31 +140,13 @@ static void unix_device_set_output_report(DEVICE_OBJECT *device, HID_XFER_PACKET
         .packet = packet,
         .io = io,
     };
-    winebus_call(device_set_output_report, &params);
-}
-
-static void unix_device_get_feature_report(DEVICE_OBJECT *device, HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
-{
-    struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
-    struct device_report_params params =
+    if (!params.device)
     {
-        .device = ext->unix_device,
-        .packet = packet,
-        .io = io,
-    };
-    winebus_call(device_get_feature_report, &params);
-}
-
-static void unix_device_set_feature_report(DEVICE_OBJECT *device, HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
-{
-    struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
-    struct device_report_params params =
-    {
-        .device = ext->unix_device,
-        .packet = packet,
-        .io = io,
-    };
-    winebus_call(device_set_feature_report, &params);
+        io->Status = STATUS_DEVICE_NOT_CONNECTED;
+        io->Information = 0;
+        return;
+    }
+    winebus_call(code, &params);
 }
 
 static DWORD get_device_index(struct device_desc *desc, struct list **before)
@@ -453,6 +437,7 @@ static DEVICE_OBJECT *bus_find_device_from_vid_pid(const BOOL is_hidraw, struct 
 
     LIST_FOR_EACH_ENTRY(ext, &device_list, struct device_extension, entry)
     {
+        if (!ext->unix_device) continue;
         found_usages = get_device_usages(ext->unix_device, &buttons);
         if (ext->desc.is_hidraw == is_hidraw && ext->desc.vid == desc->vid &&
             ext->desc.pid == desc->pid && found_usages.UsagePage == usages->UsagePage &&
@@ -468,6 +453,7 @@ static void bus_unlink_hid_device(DEVICE_OBJECT *device)
 
     RtlEnterCriticalSection(&device_list_cs);
     list_remove(&ext->entry);
+    list_init(&ext->entry);
     RtlLeaveCriticalSection(&device_list_cs);
 }
 
@@ -986,6 +972,89 @@ static USAGE_AND_PAGE get_device_usages(UINT64 unix_device, UINT *buttons)
     return usages;
 }
 
+static BOOL keep_steam_input_device(const struct device_desc *desc)
+{
+    const char *sgi;
+
+    /* Only evdev Steam controllers have a stable player slot. SDL emulation does not. */
+    if (desc->vid != 0x28de || desc->pid != 0x11ff || desc->is_hidraw ||
+        !desc->is_gamepad || desc->input == ~0u) return FALSE;
+
+    sgi = getenv("SteamGameId");
+    return sgi && !strcmp(sgi, "298110");
+}
+
+/* Both helpers are called with device_list_cs held, before taking ext->cs. */
+static BOOL bus_retain_steam_input_device(DEVICE_OBJECT *device)
+{
+    struct device_extension *ext = device->DeviceExtension;
+    BOOL retained = FALSE;
+
+    if (!keep_steam_input_device(&ext->desc)) return FALSE;
+
+    RtlEnterCriticalSection(&ext->cs);
+    if (ext->state == DEVICE_STATE_STARTED)
+    {
+        TRACE("Keeping Steam Input slot %u during removal\n", ext->desc.input);
+        unix_device_remove(device);
+        retained = TRUE;
+    }
+    RtlLeaveCriticalSection(&ext->cs);
+    return retained;
+}
+
+static DEVICE_OBJECT *bus_reuse_steam_input_device(const struct device_desc *desc, UINT64 unix_device)
+{
+    struct device_descriptor_params params = {.device = unix_device};
+    struct device_start_params start_params = {.device = unix_device};
+    struct device_extension *ext;
+    DEVICE_OBJECT *device = NULL;
+    NTSTATUS status;
+    UINT length;
+
+    LIST_FOR_EACH_ENTRY(ext, &device_list, struct device_extension, entry)
+    {
+        if (ext->unix_device || ext->desc.vid != desc->vid || ext->desc.pid != desc->pid ||
+            ext->desc.input != desc->input || ext->desc.version != desc->version ||
+            ext->desc.is_hidraw != desc->is_hidraw || ext->desc.is_gamepad != desc->is_gamepad) continue;
+
+        RtlEnterCriticalSection(&ext->cs);
+        if (ext->state != DEVICE_STATE_STARTED)
+        {
+            RtlLeaveCriticalSection(&ext->cs);
+            continue;
+        }
+
+        /* Cached descriptors and report buffers can only be reused with the same layout. */
+        params.length = ext->report_desc_length;
+        params.out_length = &length;
+        if (!(params.buffer = malloc(params.length))) status = STATUS_NO_MEMORY;
+        else
+        {
+            status = winebus_call(device_get_report_descriptor, &params);
+            if (!status && (length != params.length || memcmp(params.buffer, ext->report_desc, length)))
+                status = STATUS_INVALID_PARAMETER;
+            free(params.buffer);
+        }
+
+        if (!status) status = winebus_call(device_start, &start_params);
+        if (!status)
+        {
+            TRACE("Reusing Steam Input slot %u\n", desc->input);
+            ext->unix_device = unix_device;
+            device = ext->device;
+        }
+        RtlLeaveCriticalSection(&ext->cs);
+        if (status)
+        {
+            WARN("Cannot reuse Steam Input slot %u, status %#lx\n", desc->input, status);
+            bus_unlink_hid_device(ext->device);
+        }
+        break;
+    }
+    return device;
+}
+
 static DWORD bus_count;
 static HANDLE bus_thread[16];
 
@@ -1025,6 +1094,11 @@ static DWORD CALLBACK bus_main_thread(void *args)
             RtlEnterCriticalSection(&device_list_cs);
             device = bus_find_unix_device(event->device);
             if (!device) WARN("could not find device for %s bus device %#I64x\n", debugstr_w(bus.name), event->device);
+            else if (bus_retain_steam_input_device(device))
+            {
+                RtlLeaveCriticalSection(&device_list_cs);
+                break;
+            }
             else bus_unlink_hid_device(device);
             RtlLeaveCriticalSection(&device_list_cs);
             IoInvalidateDeviceRelations(bus_pdo, BusRelations);
@@ -1035,10 +1109,18 @@ static DWORD CALLBACK bus_main_thread(void *args)
             USAGE_AND_PAGE usages;
             UINT buttons;
             BOOL hidraw_enabled;
+            BOOL reused = FALSE;
 
             usages = get_device_usages(event->device, &buttons);
             hidraw_enabled = is_hidraw_enabled(desc.vid, desc.pid, &usages, buttons);
-            if (desc.is_hidraw && !hidraw_enabled)
+            if (keep_steam_input_device(&desc))
+            {
+                RtlEnterCriticalSection(&device_list_cs);
+                if ((device = bus_reuse_steam_input_device(&desc, event->device))) reused = TRUE;
+                else device = bus_create_hid_device(&desc, event->device);
+                RtlLeaveCriticalSection(&device_list_cs);
+            }
+            else if (desc.is_hidraw && !hidraw_enabled)
             {
                 struct device_remove_params params = {.device = event->device};
                 WARN("ignoring %shidraw device %04x:%04x with usages %04x:%04x\n", desc.is_hidraw ? "" : "non-",
@@ -1067,8 +1149,8 @@ static DWORD CALLBACK bus_main_thread(void *args)
                 TRACE("creating %shidraw device %04x:%04x with usages %04x:%04x\n", desc.is_hidraw ? "" : "non-",
                       desc.vid, desc.pid, usages.UsagePage, usages.Usage);
 
-            if (device) IoInvalidateDeviceRelations(bus_pdo, BusRelations);
-            else
+            if (!reused) IoInvalidateDeviceRelations(bus_pdo, BusRelations);
+            if (!device)
             {
                 struct device_remove_params params = {.device = event->device};
                 WARN("failed to create device for %s bus device %#I64x\n", debugstr_w(bus.name), event->device);
@@ -1481,7 +1563,9 @@ static NTSTATUS pdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
             remove_pending_irps(device);
 
             bus_unlink_hid_device(device);
+            RtlEnterCriticalSection(&ext->cs);
             unix_device_remove(device);
+            RtlLeaveCriticalSection(&ext->cs);
 
             ext->cs.DebugInfo->Spare[0] = 0;
             DeleteCriticalSection(&ext->cs);
@@ -1707,14 +1791,14 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
                     TRACE("%s\n", buffer);
                 }
             }
-            unix_device_set_output_report(device, packet, &irp->IoStatus);
+            unix_device_report(device, device_set_output_report, packet, &irp->IoStatus);
             if (!irp->IoStatus.Status) hidraw_disable_report_fixups(device);
             break;
         }
         case IOCTL_HID_GET_FEATURE:
         {
             HID_XFER_PACKET *packet = (HID_XFER_PACKET *)irp->UserBuffer;
-            unix_device_get_feature_report(device, packet, &irp->IoStatus);
+            unix_device_report(device, device_get_feature_report, packet, &irp->IoStatus);
             if (!irp->IoStatus.Status) hidraw_disable_report_fixups(device);
             if (!irp->IoStatus.Status && TRACE_ON(hid))
             {
@@ -1745,7 +1829,7 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
                     TRACE("%s\n", buffer);
                 }
             }
-            unix_device_set_feature_report(device, packet, &irp->IoStatus);
+            unix_device_report(device, device_set_feature_report, packet, &irp->IoStatus);
             if (!irp->IoStatus.Status) hidraw_disable_report_fixups(device);
             break;
         }
