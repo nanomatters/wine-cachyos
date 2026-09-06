@@ -3630,7 +3630,6 @@ BOOL load_dll_optiscaler_hack(LPCWSTR name, LPWSTR override, DWORD size)
                                  FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE );
             TRACE ( "trying to open %s, status=%lx\n", debugstr_w(override), status );
             NtClose( handle );
-            RtlFreeUnicodeString( &overrideW );
             if ( !status ) cached = 2;
         }
         return cached == 2;
