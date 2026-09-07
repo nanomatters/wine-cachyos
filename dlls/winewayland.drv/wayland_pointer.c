@@ -24,6 +24,7 @@
 
 #include "config.h"
 
+#include <limits.h>
 #include <linux/input.h>
 #undef SW_MAX /* Also defined in winuser.rh */
 #include <math.h>
@@ -36,6 +37,8 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(cursor);
+
+static double cursor_size = 1.0;
 
 /* The cursor-shape-v1 protocol file references the zwp_tablet_tool_v2
  * interface object. Since we don't currently use the tablet protocol,
@@ -782,11 +785,28 @@ static const struct zwp_locked_pointer_v1_listener locked_pointer_v1_listener =
 
 static void wayland_pointer_destroy_constraint(struct wayland_pointer *pointer);
 
+static double get_cursor_size(void)
+{
+    const char *env = getenv("PROTON_WAYLAND_CURSOR_SCALE");
+    char *end;
+    double size;
+
+    if (!env || !*env) return 1.0;
+
+    size = strtod(env, &end);
+    if (end != env && !*end && isfinite(size) && size >= 0.25 && size <= 8.0)
+        return size;
+
+    WARN("Invalid PROTON_WAYLAND_CURSOR_SCALE %s, using 1.\n", debugstr_a(env));
+    return 1.0;
+}
+
 void wayland_pointer_init(struct wl_pointer *wl_pointer)
 {
     struct wayland_pointer *pointer = &process_wayland.pointer;
 
     pthread_mutex_lock(&pointer->mutex);
+    cursor_size = get_cursor_size();
     pointer->wl_pointer = wl_pointer;
     pointer->focused_wl_surface = NULL;
     pointer->constraint_wl_surface = NULL;
@@ -920,7 +940,7 @@ static BOOL cursor_buffer_is_transparent(struct wayland_shm_buffer *shm_buffer)
     return TRUE;
 }
 
-static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
+static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor)
 {
     struct wayland_cursor *cursor = &process_wayland.pointer.cursor;
     ICONINFOEXW info = {0};
@@ -975,9 +995,6 @@ static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
         cursor->hotspot_y = cursor->shm_buffer->height / 2;
     }
 
-    cursor->hotspot_x = round(cursor->hotspot_x / scale);
-    cursor->hotspot_y = round(cursor->hotspot_y / scale);
-
     return;
 
 clear_cursor:
@@ -1009,9 +1026,12 @@ static void wayland_pointer_clear_cursor_surface(void)
     }
 }
 
-static void wayland_pointer_update_cursor_surface(double scale)
+static void wayland_pointer_update_cursor_surface(double scale, POINT *hotspot)
 {
     struct wayland_cursor *cursor = &process_wayland.pointer.cursor;
+    int width, height;
+
+    hotspot->x = hotspot->y = 0;
 
     if (!cursor->shm_buffer) goto clear_cursor;
 
@@ -1049,9 +1069,23 @@ static void wayland_pointer_update_cursor_surface(double scale)
      * scale. Note that setting the viewport destination overrides
      * the buffer scale, so it's fine to set both. */
     wl_surface_set_buffer_scale(cursor->wl_surface, round(scale));
-    wp_viewport_set_destination(cursor->wp_viewport,
-                                round(cursor->shm_buffer->width / scale),
-                                round(cursor->shm_buffer->height / scale));
+    /* Magnify only the cursor viewport, not the buffer or window scale. */
+    width = fmax(1.0, fmin(INT_MAX, round(cursor->shm_buffer->width * cursor_size / scale)));
+    height = fmax(1.0, fmin(INT_MAX, round(cursor->shm_buffer->height * cursor_size / scale)));
+    wp_viewport_set_destination(cursor->wp_viewport, width, height);
+
+    if (cursor_size == 1.0)
+    {
+        /* Preserve the default hotspot rounding. */
+        hotspot->x = round(cursor->hotspot_x / scale);
+        hotspot->y = round(cursor->hotspot_y / scale);
+    }
+    else
+    {
+        /* Use the final rounded size and the original bitmap hotspot. */
+        hotspot->x = round((double)cursor->hotspot_x * width / cursor->shm_buffer->width);
+        hotspot->y = round((double)cursor->hotspot_y * height / cursor->shm_buffer->height);
+    }
     wl_surface_commit(cursor->wl_surface);
 
     return;
@@ -1202,13 +1236,14 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
         }
         else
         {
-            if (use_hcursor) wayland_pointer_update_cursor_buffer(hcursor, scale);
-            wayland_pointer_update_cursor_surface(scale);
+            POINT hotspot;
+
+            if (use_hcursor) wayland_pointer_update_cursor_buffer(hcursor);
+            wayland_pointer_update_cursor_surface(scale, &hotspot);
             wl_pointer_set_cursor(pointer->wl_pointer,
                                   pointer->enter_serial,
                                   pointer->cursor.wl_surface,
-                                  pointer->cursor.hotspot_x,
-                                  pointer->cursor.hotspot_y);
+                                  hotspot.x, hotspot.y);
             wayland_pointer_clear_cursor_shape();
         }
         wl_display_flush(process_wayland.wl_display);

@@ -165,6 +165,7 @@ struct wayland_cursor
     struct wayland_shm_buffer *shm_buffer;
     struct wl_surface *wl_surface;
     struct wp_viewport *wp_viewport;
+    /* Hotspot in cursor bitmap pixels, before viewport scaling. */
     int hotspot_x, hotspot_y;
 };
 
