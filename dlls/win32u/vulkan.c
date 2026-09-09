@@ -560,6 +560,9 @@ static BOOL swapchain_is_out_of_date( const struct swapchain *swapchain )
 
 static void swapchain_apply_color_description( struct swapchain *swapchain )
 {
+    /* Retired swapchains must not reclaim color management from their replacement. */
+    if (swapchain != swapchain->surface->swapchain) return;
+
     driver_funcs->p_vulkan_surface_set_color_description(
             swapchain->color_space, swapchain->uses_color_description,
             swapchain->surface->client );
@@ -5303,6 +5306,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     BOOL topology_updated = FALSE;
     BOOL automatic_fullscreen = FALSE;
     BOOL fullscreen_prepared = FALSE;
+    BOOL color_space_supported = TRUE;
     BOOL compositor_scaling;
     BOOL use_fshack;
     BOOL lite;
@@ -5436,9 +5440,6 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device, surface_host_handle( surface ), &capabilities );
     if (res) goto failed_locked;
 
-    mapped_color_space =
-        driver_funcs->p_vulkan_map_colorspace( create_info_host.imageColorSpace, surface->client );
-    create_info_host.imageColorSpace = mapped_color_space;
     create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
     create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
 
@@ -5480,8 +5481,6 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     swapchain->fullscreen_policy = fullscreen_policy;
     swapchain->fullscreen_owner = fullscreen_owner;
     swapchain->color_space = create_info->imageColorSpace;
-    swapchain->uses_color_description =
-        mapped_color_space != create_info->imageColorSpace;
     swapchain->host_extents = capabilities.minImageExtent;
     if (compositor_scaling)
         TRACE( "Using compositor presentation scaling for hwnd %p swapchain extent %s\n",
@@ -5574,10 +5573,12 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         }
     }
 
-    /* check if the new colorspace works with the provided format */
-    if (create_info_host.imageColorSpace != create_info->imageColorSpace)
+    /* Preserve native HDR signaling for host layers. Only use Wine's Wayland
+     * color description when the host cannot present the requested pair. */
+    if (create_info_host.imageColorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT ||
+        create_info_host.imageColorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
     {
-        BOOL found = FALSE;
+        color_space_supported = FALSE;
 
         res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device, surface_host_handle( surface ), &format_count, NULL );
         if (res) goto failed_locked;
@@ -5597,26 +5598,29 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         {
             if (formats[i].format == create_info_host.imageFormat &&
                 formats[i].colorSpace == create_info_host.imageColorSpace)
-                found = TRUE;
+                color_space_supported = TRUE;
         }
 
-        /* HACK: try again with VK_COLOR_SPACE_SRGB_NONLINEAR_KHR */
-        if (!found && create_info_host.imageColorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT)
+        if (!color_space_supported && create_info_host.imageColorSpace == create_info->imageColorSpace)
         {
-            create_info_host.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-            goto again;
+            mapped_color_space = driver_funcs->p_vulkan_map_colorspace(
+                    create_info->imageColorSpace, surface->client );
+            if (mapped_color_space != create_info_host.imageColorSpace)
+            {
+                create_info_host.imageColorSpace = mapped_color_space;
+                goto again;
+            }
         }
 
-        if (!found)
-        {
-            ERR("Colorspace %u is not compatible with format %u\n",
-                create_info_host.imageColorSpace, create_info_host.imageFormat);
-            create_info_host.imageColorSpace = create_info->imageColorSpace;
-        }
+        if (color_space_supported && create_info_host.imageColorSpace == create_info->imageColorSpace)
+            TRACE( "Using native HDR colorspace %u for format %u\n",
+                   create_info_host.imageColorSpace, create_info_host.imageFormat );
 
         free( formats );
         formats = NULL;
     }
+    swapchain->uses_color_description = color_space_supported &&
+                                       create_info_host.imageColorSpace != create_info->imageColorSpace;
 
     swapchain->has_alpha = !(create_info_host.compositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR);
     if (swapchain->has_alpha) surface->alpha_swapchain_count++;
@@ -5661,6 +5665,21 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         TRACE( "managed dmabuf unavailable for hwnd %p (external memory %u), using host swapchain\n",
                surface->hwnd, device->extensions.has_VK_EXT_external_memory_dma_buf );
     }
+
+    /* Only pass-through lets Wine own the color description. An sRGB host
+     * swapchain may manage color itself, so it cannot carry untagged HDR. */
+    if (!color_space_supported)
+    {
+        WARN( "No native or pass-through presentation for colorspace %u, format %u\n",
+              create_info->imageColorSpace, create_info_host.imageFormat );
+        res = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        goto failed_locked;
+    }
+
+    /* Release Wine's color-management object before the host can claim the
+     * surface. For pass-through, Wine installs its description on first present. */
+    driver_funcs->p_vulkan_surface_set_color_description( create_info->imageColorSpace, FALSE,
+                                                         surface->client );
 
     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
         goto failed_locked;

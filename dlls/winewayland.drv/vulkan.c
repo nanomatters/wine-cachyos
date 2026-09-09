@@ -491,13 +491,13 @@ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace,
         wayland_vulkan_image_color_space(colorspace);
     enum wayland_image_description_status status;
 
-    if (!client) return colorspace;
+    if (!client || color_space == WAYLAND_IMAGE_DESCRIPTION_DEFAULT) return colorspace;
 
-    if (!wayland_client_surface_set_image_description(client, color_space))
+    /* Select the fallback without claiming the wl_surface. The old host
+     * swapchain may still own its color-management object until replacement. */
+    status = wayland_color_manager_get_image_description(color_space, NULL);
+    if (status != WAYLAND_IMAGE_DESCRIPTION_READY)
     {
-        status = wayland_color_manager_get_image_description(color_space, NULL);
-        wayland_client_surface_set_image_description(
-                client, WAYLAND_IMAGE_DESCRIPTION_DEFAULT);
         if (status == WAYLAND_IMAGE_DESCRIPTION_UNINITIALIZED ||
             status == WAYLAND_IMAGE_DESCRIPTION_PENDING)
             TRACE("Image description is not ready; using host colorspace %u.\n", colorspace);
@@ -506,7 +506,6 @@ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace,
         return colorspace;
     }
 
-    if (color_space == WAYLAND_IMAGE_DESCRIPTION_DEFAULT) return colorspace;
     TRACE("mapping colorspace %u => %u\n", colorspace, VK_COLOR_SPACE_PASS_THROUGH_EXT);
     return VK_COLOR_SPACE_PASS_THROUGH_EXT;
 }
