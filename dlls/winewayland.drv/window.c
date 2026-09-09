@@ -477,9 +477,15 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
 
     conf->minimized = style & WS_MINIMIZE;
     /* The Win32 iconic rect is not compositor geometry. */
-    if (!conf->minimized)
+    if (!conf->minimized || IsRectEmpty(&conf->rect))
     {
-        if (has_presentation_rect)
+        if (conf->minimized && data->restore_rect_valid)
+        {
+            conf->rect = data->restore_rect;
+            conf->window_rect = data->restore_rect;
+            conf->client_rect = data->restore_rect;
+        }
+        else if (has_presentation_rect)
         {
             conf->rect = presentation_rect;
             conf->window_rect = presentation_rect;
@@ -493,7 +499,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
         }
 
         /* Keep framed fullscreen extents out of the Wayland geometry. */
-        if (!has_presentation_rect && fullscreen &&
+        if (!conf->minimized && !has_presentation_rect && fullscreen &&
             (style & (WS_CAPTION | WS_THICKFRAME)))
         {
             conf->rect = data->rects.client;
@@ -707,6 +713,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     struct wayland_surface *parent_surface, *surface;
     enum wayland_surface_role role;
     BOOL visible, layer_set, keep_toplevel_mapped, fullscreen_target_active;
+    BOOL first_show_minimized;
     BOOL server_decor = FALSE;
     DWORD exstyle = data->exstyle;
     DWORD style = data->style;
@@ -747,12 +754,15 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     fullscreen_target_active = surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
                                surface->fullscreen_requested &&
                                wayland_output_get_layout_rect(surface->requested_output, NULL);
+    /* An initially iconic window has no toplevel yet to preserve. Its
+     * off-screen Win32 coordinates must not prevent its first mapping. */
+    first_show_minimized = (style & WS_MINIMIZE) && (!surface || !surface->role);
     if (keep_toplevel_mapped)
         visible = TRUE;
 
     if (visible && !owned_overlay && !owner_surface && !use_layer_shell && !toplevel_surface &&
         !wayland_output_layout_intersects_rect(&data->rects.window) &&
-        !keep_toplevel_mapped && !fullscreen_target_active)
+        !keep_toplevel_mapped && !fullscreen_target_active && !first_show_minimized)
         visible = FALSE;
 
     /* If the toplevel has no observable area, make it roleless. */
@@ -1855,6 +1865,7 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         struct wayland_win_data *data;
         struct wayland_surface *surface;
+        BOOL ensure_contents = FALSE;
 
         if ((data = wayland_win_data_get(hwnd)))
         {
@@ -1866,11 +1877,13 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 {
                     xdg_toplevel_set_minimized(surface->xdg_toplevel);
                     surface->comitted.minimized = TRUE;
+                    ensure_contents = !surface->content_width;
                     wl_display_flush(process_wayland.wl_display);
                 }
             }
             wayland_win_data_release(data);
         }
+        if (ensure_contents) ensure_window_surface_contents(hwnd);
         return 0;
     }
     case WM_WINE_MAP_NOTIFY_ICON_POINT:
@@ -2619,9 +2632,18 @@ void ensure_window_surface_contents(HWND hwnd)
                 wayland_surface_commit_pending_state(wayland_surface);
             }
 
+            /* Mapping needs a buffer even when the application starts minimized
+             * and never paints. Wait for both the minimize request and configure;
+             * later minimized updates still leave the existing contents alone. */
+            if (wayland_surface_is_toplevel(wayland_surface) &&
+                wayland_surface->window.minimized && wayland_surface->comitted.minimized &&
+                !wayland_surface->content_width)
+                wayland_surface_attach_transparent_carrier(wayland_surface);
+
             /* Producer content already visible: do not create a fallback
              * window surface that could replace its carrier with default pixels. */
-            if (!data->window_contents && !has_dmabuf_content) expose = TRUE;
+            if (!wayland_surface->window.minimized &&
+                !data->window_contents && !has_dmabuf_content) expose = TRUE;
         }
 
         /* Flush queued commits now: the dmabuf present path has no other flush
