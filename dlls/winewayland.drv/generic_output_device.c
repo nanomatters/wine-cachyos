@@ -61,10 +61,13 @@ BOOL wayland_output_edid_is_valid(const unsigned char *edid, UINT edid_len)
     return TRUE;
 }
 
-BOOL wayland_output_edid_supports_hdr(const unsigned char *edid, UINT edid_len)
+BOOL wayland_output_get_edid_hdr_info(const unsigned char *edid, UINT edid_len,
+                                      UINT *max_luminance)
 {
+    BOOL supported = FALSE;
     UINT i;
 
+    *max_luminance = 0;
     if (!wayland_output_edid_is_valid(edid, edid_len)) return FALSE;
 
     for (i = 128; i < edid_len; i += 128)
@@ -87,11 +90,17 @@ BOOL wayland_output_edid_supports_hdr(const unsigned char *edid, UINT edid_len)
             if (offset > end) break;
 
             if (tag == 0x7 && len >= 2 && data[0] == 0x06 && (data[1] & 0x04))
-                return TRUE;
+            {
+                supported = TRUE;
+                /* CTA-861 encodes the optional HDR peak in units of 50 * 2^(CV/32) nits.
+                 * A missing or zero code means the peak is unspecified. */
+                if (len >= 4 && data[3] && !*max_luminance)
+                    *max_luminance = round(50.0 * exp2(data[3] / 32.0));
+            }
         }
     }
 
-    return FALSE;
+    return supported;
 }
 
 /* borrowed from gamescope with permission */

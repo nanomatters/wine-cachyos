@@ -451,6 +451,8 @@ struct wayland_output_state
     uint32_t max_cll;
     uint32_t max_target_lum;
     uint32_t ref_lum;
+    uint32_t primaries_named;
+    uint32_t tf_named;
     BOOL supports_hdr;
 };
 
@@ -748,7 +750,8 @@ BOOL wayland_output_get_layout_rect(const struct wl_output *wl_output, RECT *rec
 BOOL wayland_output_layout_intersects_rect(const RECT *rect);
 void output_info_array_update(void);
 BOOL wayland_output_edid_is_valid(const unsigned char *edid, UINT edid_len);
-BOOL wayland_output_edid_supports_hdr(const unsigned char *edid, UINT edid_len);
+BOOL wayland_output_get_edid_hdr_info(const unsigned char *edid, UINT edid_len,
+                                      UINT *max_luminance);
 UINT wayland_generic_output_get_edid_override(const char *output_name, unsigned char **edid);
 UINT wayland_generic_output_get_edid_sysfs(const char *output_name, unsigned char **edid);
 UINT wayland_generic_output_get_edid(const struct wayland_output_state *output,

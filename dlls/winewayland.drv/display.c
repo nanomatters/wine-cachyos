@@ -264,6 +264,7 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
     const char *env;
     struct gdi_monitor monitor = {0};
     UINT64 sdr_white_level;
+    UINT edid_max_luminance = 0;
 
     SetRect(&monitor.rc_monitor, output_info->x, output_info->y,
             output_info->x + output_info->output->current_mode->width,
@@ -277,7 +278,8 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
                                                                  &monitor.edid);
 
     if (monitor.edid_len)
-        panel_hdr_supported = wayland_output_edid_supports_hdr(monitor.edid, monitor.edid_len);
+        panel_hdr_supported = wayland_output_get_edid_hdr_info(monitor.edid, monitor.edid_len,
+                                                               &edid_max_luminance);
     else
         /* Without a real EDID, use the output's HDR state, retaining the
          * compositor capability hint for outputs currently in SDR. */
@@ -285,6 +287,20 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
 
     monitor.hdr_supported = panel_hdr_supported && wayland_color_manager_can_present_bt2100();
     desktop_hdr_enabled = output->supports_hdr;
+    /* With no headroom, a BT.2020 container targeting the EDID's HDR peak is
+     * additional evidence of HDR mode. This is a heuristic: wide-gamut SDR
+     * can also use BT.2020. Require the real EDID peak and allow one nit for
+     * rounding, without treating compositor capability alone as active HDR. */
+    if (!desktop_hdr_enabled && monitor.hdr_supported && edid_max_luminance &&
+        output->primaries_named == WP_COLOR_MANAGER_V1_PRIMARIES_BT2020 &&
+        output->ref_lum >= output->max_target_lum &&
+        output->max_target_lum >= edid_max_luminance - 1 &&
+        output->max_target_lum <= edid_max_luminance + 1)
+    {
+        TRACE("Inferring HDR for %s from BT.2020 and EDID peak %u (target=%u reference=%u)\n",
+              output->name, edid_max_luminance, output->max_target_lum, output->ref_lum);
+        desktop_hdr_enabled = TRUE;
+    }
     monitor.hdr_enabled = monitor.hdr_supported && desktop_hdr_enabled;
     if ((env = getenv("DXVK_HDR")) && *env == '1')
     {

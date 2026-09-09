@@ -48,10 +48,13 @@ static uint32_t next_output_id = 0;
 #define WAYLAND_OUTPUT_CHANGED_REF_L        0x100
 #define WAYLAND_OUTPUT_CHANGED_MAX_TARGET_L 0x200
 #define WAYLAND_OUTPUT_CHANGED_COLOR        0x400
+#define WAYLAND_OUTPUT_CHANGED_NAMED_PRIM   0x800
+#define WAYLAND_OUTPUT_CHANGED_TF_NAMED      0x1000
 
 #define WAYLAND_OUTPUT_COLOR_FLAGS (WAYLAND_OUTPUT_CHANGED_PRIMARIES | WAYLAND_OUTPUT_CHANGED_FALL | \
                                    WAYLAND_OUTPUT_CHANGED_CLL | WAYLAND_OUTPUT_CHANGED_REF_L | \
-                                   WAYLAND_OUTPUT_CHANGED_MAX_TARGET_L)
+                                   WAYLAND_OUTPUT_CHANGED_MAX_TARGET_L | \
+                                   WAYLAND_OUTPUT_CHANGED_NAMED_PRIM | WAYLAND_OUTPUT_CHANGED_TF_NAMED)
 
 /**********************************************************************
  *          Output handling
@@ -213,13 +216,19 @@ static void wayland_output_done(struct wayland_output *output)
                 output->pending.max_target_lum : 0;
         output->current.ref_lum = output->pending_flags & WAYLAND_OUTPUT_CHANGED_REF_L ?
                 output->pending.ref_lum : 0;
+        output->current.primaries_named = output->pending_flags & WAYLAND_OUTPUT_CHANGED_NAMED_PRIM ?
+                output->pending.primaries_named : 0;
+        output->current.tf_named = output->pending_flags & WAYLAND_OUTPUT_CHANGED_TF_NAMED ?
+                output->pending.tf_named : 0;
         output->pending_flags &= ~WAYLAND_OUTPUT_COLOR_FLAGS;
     }
 
-    /* Desktop HDR depends on the output's luminance headroom, not support for
-     * scRGB or extended target volumes when creating image descriptions. */
-    output->current.supports_hdr = output->current.ref_lum &&
-                                  output->current.max_target_lum > output->current.ref_lum;
+    /* HDR encodings remain a positive signal when SDR white reaches the peak.
+     * Retain headroom detection for linear or gamma-encoded compositor output. */
+    output->current.supports_hdr = output->current.tf_named == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ ||
+                                  output->current.tf_named == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG ||
+                                  (output->current.ref_lum &&
+                                   output->current.max_target_lum > output->current.ref_lum);
     if (output->current.supports_hdr && !wayland_color_manager_can_present_bt2100() &&
         !warned_no_bt2100)
     {
@@ -397,6 +406,11 @@ static void wayland_image_description_info_v1_primaries_named(void *data,
 				            struct wp_image_description_info_v1 *info,
 				            uint32_t primaries)
 {
+    struct wayland_output *output = data;
+
+    TRACE("container primaries: %u\n", primaries);
+    output->pending.primaries_named = primaries;
+    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_NAMED_PRIM;
 }
 
 static void wayland_image_description_info_v1_tfpower(void *data,
@@ -409,6 +423,11 @@ static void wayland_image_description_info_v1_tfnamed(void *data,
 				            struct wp_image_description_info_v1 *info,
 				            uint32_t named)
 {
+    struct wayland_output *output = data;
+
+    TRACE("transfer function: %u\n", named);
+    output->pending.tf_named = named;
+    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_TF_NAMED;
 }
 
 static void wayland_image_description_info_v1_luminance(void *data,
@@ -417,7 +436,7 @@ static void wayland_image_description_info_v1_luminance(void *data,
 {
     struct wayland_output *output = data;
 
-    TRACE("reference luminance: %u\n", ref);
+    TRACE("luminance: min=%u/10000 max=%u reference=%u\n", min, max, ref);
 
     output->pending.ref_lum = ref;
     output->pending_flags |= WAYLAND_OUTPUT_CHANGED_REF_L;
