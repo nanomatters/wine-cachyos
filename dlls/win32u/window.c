@@ -2643,6 +2643,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
 
     /* Keep presentation geometry separate from the HWND geometry used for input. */
     has_present_rect = get_present_rect( hwnd, &presentation_rect, get_thread_dpi() );
+    rects->visible = rects->window;
     if (is_child) monitor_rects = map_dpi_window_rects( *rects, get_thread_dpi(), raw_dpi );
     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
 
