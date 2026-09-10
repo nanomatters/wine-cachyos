@@ -185,6 +185,7 @@ enum d3dkmt_telemetry_path
     D3DKMT_TELEMETRY_PATH_POWER,
     D3DKMT_TELEMETRY_PATH_POWER_LIMIT,
     D3DKMT_TELEMETRY_PATH_TEMPERATURE,
+    D3DKMT_TELEMETRY_PATH_JUNCTION_TEMPERATURE,
     D3DKMT_TELEMETRY_PATH_UTILIZATION,
     D3DKMT_TELEMETRY_PATH_MEMORY_UTILIZATION,
     D3DKMT_TELEMETRY_PATH_GRAPHICS_CLOCK,
@@ -237,6 +238,7 @@ struct d3dkmt_adapter
     LONG64 volatile telemetry_power;
     LONG volatile telemetry_power_limit;
     LONG volatile telemetry_temperature;
+    LONG volatile telemetry_junction_temperature;
     LONG volatile telemetry_utilization;
     LONG volatile telemetry_memory_utilization;
     LONG volatile telemetry_graphics_clock;
@@ -893,7 +895,8 @@ static BOOL find_hwmon_value_path( const char *root, const char *const *names, U
     return FALSE;
 }
 
-static BOOL find_hwmon_labeled_value_path( const char *root, const char *label, char **result )
+static BOOL find_hwmon_labeled_value_path( const char *root, const char *type,
+                                           const char *label, char **result )
 {
     char label_path[PATH_MAX], value_path[PATH_MAX], buffer[64];
     struct dirent *entry;
@@ -907,11 +910,11 @@ static BOOL find_hwmon_labeled_value_path( const char *root, const char *label, 
         if (entry->d_name[0] == '.') continue;
         for (i = 1; i <= 32; ++i)
         {
-            len = snprintf( label_path, sizeof(label_path), "%s/%s/freq%u_label", root, entry->d_name, i );
+            len = snprintf( label_path, sizeof(label_path), "%s/%s/%s%u_label", root, entry->d_name, type, i );
             if (len < 0 || len >= sizeof(label_path) ||
                 !read_sysfs_line( label_path, buffer, sizeof(buffer) ) || strcmp( buffer, label ))
                 continue;
-            len = snprintf( value_path, sizeof(value_path), "%s/%s/freq%u_input", root, entry->d_name, i );
+            len = snprintf( value_path, sizeof(value_path), "%s/%s/%s%u_input", root, entry->d_name, type, i );
             if (len < 0 || len >= sizeof(value_path) ||
                 !read_sysfs_line( value_path, buffer, sizeof(buffer) ))
                 continue;
@@ -1284,9 +1287,11 @@ static BOOL init_adapter_telemetry_backend( struct d3dkmt_adapter *adapter )
                                    &adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_POWER_LIMIT], NULL );
             find_hwmon_value_path( hwmon_root, temperature_names, ARRAY_SIZE(temperature_names),
                                    &adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_TEMPERATURE], NULL );
-            find_hwmon_labeled_value_path( hwmon_root, "sclk",
+            find_hwmon_labeled_value_path( hwmon_root, "temp", "junction",
+                                           &adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_JUNCTION_TEMPERATURE] );
+            find_hwmon_labeled_value_path( hwmon_root, "freq", "sclk",
                                            &adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_GRAPHICS_CLOCK] );
-            find_hwmon_labeled_value_path( hwmon_root, "mclk",
+            find_hwmon_labeled_value_path( hwmon_root, "freq", "mclk",
                                            &adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_MEMORY_CLOCK] );
             adapter->telemetry_power_is_energy = power_name && !strcmp( power_name, "energy1_input" );
         }
@@ -1533,23 +1538,25 @@ static BOOL query_adapter_power( struct d3dkmt_adapter *adapter, ULONGLONG *powe
     return TRUE;
 }
 
-static BOOL query_adapter_temperature( struct d3dkmt_adapter *adapter, ULONG *temperature )
+static BOOL query_adapter_temperature( struct d3dkmt_adapter *adapter,
+                                        enum d3dkmt_telemetry_path sensor, ULONG *temperature )
 {
     LONGLONG value;
     unsigned int nvml_value;
 
-    if (adapter->telemetry_nvml_device && p_nvmlDeviceGetTemperature &&
+    if (sensor == D3DKMT_TELEMETRY_PATH_TEMPERATURE &&
+        adapter->telemetry_nvml_device && p_nvmlDeviceGetTemperature &&
         !p_nvmlDeviceGetTemperature( adapter->telemetry_nvml_device, 0, &nvml_value ))
     {
         *temperature = min( (ULONGLONG)nvml_value * 10, UINT32_MAX );
         return TRUE;
     }
 
-    if (!adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_TEMPERATURE] ||
-        !read_sysfs_value( adapter->telemetry_paths[D3DKMT_TELEMETRY_PATH_TEMPERATURE], &value ) || value < 0)
+    if (!adapter->telemetry_paths[sensor] ||
+        !read_sysfs_value( adapter->telemetry_paths[sensor], &value ) || value < 0)
         return FALSE;
 
-    *temperature = min( (ULONGLONG)(value + 50) / 100, UINT32_MAX );
+    *temperature = min( ((ULONGLONG)value + 50) / 100, UINT32_MAX );
     return TRUE;
 }
 
@@ -1795,6 +1802,7 @@ static void publish_adapter_telemetry( struct d3dkmt_adapter *adapter,
     telemetry_write64( &adapter->telemetry_power, sample->PowerMicrowatts );
     InterlockedExchange( &adapter->telemetry_power_limit, sample->PowerLimitMilliwatts );
     InterlockedExchange( &adapter->telemetry_temperature, sample->TemperatureDeciCelsius );
+    InterlockedExchange( &adapter->telemetry_junction_temperature, sample->JunctionTemperatureDeciCelsius );
     InterlockedExchange( &adapter->telemetry_utilization, sample->UtilizationPercent );
     InterlockedExchange( &adapter->telemetry_memory_utilization, sample->MemoryUtilizationPercent );
     InterlockedExchange( &adapter->telemetry_graphics_clock, sample->GraphicsClockKHz );
@@ -1835,8 +1843,12 @@ static void sample_adapter_telemetry( struct d3dkmt_adapter *adapter )
         query_adapter_power_limit( adapter, &sample.PowerLimitMilliwatts ))
         sample.Valid |= D3DKMT_WINE_GPU_TELEMETRY_POWER_LIMIT;
     if ((requests & D3DKMT_WINE_GPU_TELEMETRY_TEMPERATURE) &&
-        query_adapter_temperature( adapter, &sample.TemperatureDeciCelsius ))
+        query_adapter_temperature( adapter, D3DKMT_TELEMETRY_PATH_TEMPERATURE, &sample.TemperatureDeciCelsius ))
         sample.Valid |= D3DKMT_WINE_GPU_TELEMETRY_TEMPERATURE;
+    if ((requests & D3DKMT_WINE_GPU_TELEMETRY_JUNCTION_TEMPERATURE) &&
+        query_adapter_temperature( adapter, D3DKMT_TELEMETRY_PATH_JUNCTION_TEMPERATURE,
+                                    &sample.JunctionTemperatureDeciCelsius ))
+        sample.Valid |= D3DKMT_WINE_GPU_TELEMETRY_JUNCTION_TEMPERATURE;
 
     sample.Valid |= query_adapter_utilization( adapter, requests, &sample.UtilizationPercent,
                                                 &sample.MemoryUtilizationPercent );
@@ -2011,6 +2023,7 @@ static void read_adapter_telemetry( struct d3dkmt_adapter *adapter, D3DKMT_WINE_
         sample.PowerMicrowatts = telemetry_read64( &adapter->telemetry_power );
         sample.PowerLimitMilliwatts = ReadAcquire( &adapter->telemetry_power_limit );
         sample.TemperatureDeciCelsius = ReadAcquire( &adapter->telemetry_temperature );
+        sample.JunctionTemperatureDeciCelsius = ReadAcquire( &adapter->telemetry_junction_temperature );
         sample.UtilizationPercent = ReadAcquire( &adapter->telemetry_utilization );
         sample.MemoryUtilizationPercent = ReadAcquire( &adapter->telemetry_memory_utilization );
         sample.GraphicsClockKHz = ReadAcquire( &adapter->telemetry_graphics_clock );
@@ -2049,7 +2062,7 @@ static NTSTATUS query_wine_gpu_telemetry( struct d3dkmt_adapter *adapter,
                      D3DKMT_WINE_GPU_TELEMETRY_POWER_LIMIT | D3DKMT_WINE_GPU_TELEMETRY_UTILIZATION |
                      D3DKMT_WINE_GPU_TELEMETRY_MEMORY_UTIL | D3DKMT_WINE_GPU_TELEMETRY_CLOCK |
                      D3DKMT_WINE_GPU_TELEMETRY_MEMORY_CLOCK | D3DKMT_WINE_GPU_TELEMETRY_VRAM |
-                     D3DKMT_WINE_GPU_TELEMETRY_PCIE;
+                     D3DKMT_WINE_GPU_TELEMETRY_PCIE | D3DKMT_WINE_GPU_TELEMETRY_JUNCTION_TEMPERATURE;
 
     if (index) return STATUS_INVALID_PARAMETER;
     memset( data, 0, sizeof(*data) );
@@ -2065,11 +2078,12 @@ static NTSTATUS query_wine_gpu_telemetry( struct d3dkmt_adapter *adapter,
 
     report_telemetry_thread_error( adapter );
 
-    TRACE( "adapter %#x requested %#x valid %#x power %llu/%u temperature %u load %u/%u "
+    TRACE( "adapter %#x requested %#x valid %#x power %llu/%u temperature %u junction %u load %u/%u "
            "clock %u/%u vram %llu/%llu PCIe %u x%u/%u x%u\n",
            adapter->obj.local, requested, data->Valid,
            (unsigned long long)data->PowerMicrowatts, data->PowerLimitMilliwatts,
-           data->TemperatureDeciCelsius, data->UtilizationPercent, data->MemoryUtilizationPercent,
+           data->TemperatureDeciCelsius, data->JunctionTemperatureDeciCelsius,
+           data->UtilizationPercent, data->MemoryUtilizationPercent,
            data->GraphicsClockKHz, data->MemoryClockKHz,
            (unsigned long long)data->VramUsedBytes, (unsigned long long)data->VramTotalBytes,
            data->PcieGeneration, data->PcieWidth, data->PcieMaxGeneration, data->PcieMaxWidth );
