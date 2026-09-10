@@ -880,6 +880,24 @@ BOOL wayland_output_get_layout_rect(const struct wl_output *wl_output, RECT *rec
     return found;
 }
 
+BOOL wayland_output_get_primary_rect(RECT *rect)
+{
+    const struct output_info *info;
+    BOOL found = FALSE;
+
+    pthread_mutex_lock(&process_wayland.output_mutex);
+    /* The output array is ordered with the configured primary first. */
+    if (process_wayland.output_info_array.size)
+    {
+        info = process_wayland.output_info_array.data;
+        SetRect(rect, info->x, info->y, info->x + info->output->current_mode->width,
+                info->y + info->output->current_mode->height);
+        found = TRUE;
+    }
+    pthread_mutex_unlock(&process_wayland.output_mutex);
+    return found;
+}
+
 /**********************************************************************
  *          wayland_output_layout_intersects_rect
  */

@@ -69,6 +69,7 @@ static const char *wayland_client_surface_direct_toplevel_failure(
         struct wayland_client_surface *surface, HWND hwnd);
 static BOOL wayland_presentation_time_to_monotonic(UINT64 source_ns,
                                                    UINT64 *monotonic_ns);
+static RECT wayland_surface_map_child_rect(struct wayland_surface *surface, RECT rect);
 
 enum wayland_opaque_region_state
 {
@@ -132,12 +133,14 @@ static struct wl_region *wayland_surface_create_shape_input_region(struct waylan
     end = rect + data->rdh.nCount;
     for (; rect < end; rect++)
     {
-        int left, top, right, bottom;
+        RECT mapped = *rect;
 
-        wayland_surface_coords_from_window(surface, rect->left, rect->top, &left, &top);
-        wayland_surface_coords_from_window(surface, rect->right, rect->bottom, &right, &bottom);
-        if (right > left && bottom > top)
-            wl_region_add(region, left, top, right - left, bottom - top);
+        if (surface->window.virtual_size.cx && surface->window.virtual_size.cy)
+            OffsetRect(&mapped, -surface->window.shm_source.left, -surface->window.shm_source.top);
+        mapped = wayland_surface_map_child_rect(surface, mapped);
+        if (!IsRectEmpty(&mapped))
+            wl_region_add(region, mapped.left, mapped.top,
+                          mapped.right - mapped.left, mapped.bottom - mapped.top);
     }
 
     free(data);
@@ -3524,6 +3527,7 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
 static void wayland_surface_reconfigure_size(struct wayland_surface *surface,
                                              int width, int height)
 {
+    struct wayland_win_data *data;
     int dest_width = width, dest_height = height;
 
     if (!surface->wp_viewport) return;
@@ -3548,6 +3552,10 @@ static void wayland_surface_reconfigure_size(struct wayland_surface *surface,
     surface->configured_wp_viewport = surface->wp_viewport;
     surface->viewport_dest_width = dest_width;
     surface->viewport_dest_height = dest_height;
+
+    if (surface->child_region && (data = wayland_win_data_get_nolock(surface->hwnd)) &&
+        data->virtual_desktop)
+        wayland_surface_sync_shape_input_region(surface, surface->child_region, data->exstyle);
 }
 
 /**********************************************************************
@@ -3617,6 +3625,61 @@ static void wayland_client_surface_stack(struct wayland_surface *surface,
     wayland_surface_mark_pending_commit(surface);
 }
 
+/* Child rectangles stay in Win32 client space even when the virtual desktop's
+ * fullscreen parent is stretched to an output. Map their edges together so
+ * adjacent children retain a shared edge after scaling. */
+static RECT wayland_surface_map_child_rect(struct wayland_surface *surface, RECT rect)
+{
+    const struct wayland_window_config *window = &surface->window;
+    double scale_x, scale_y;
+
+    if (!window->virtual_size.cx || !window->virtual_size.cy)
+        return map_rect_to_surface(surface, rect);
+
+    scale_x = (double)(window->client_rect.right - window->client_rect.left) /
+              window->virtual_size.cx / window->scale;
+    scale_y = (double)(window->client_rect.bottom - window->client_rect.top) /
+              window->virtual_size.cy / window->scale;
+    rect.left = round(rect.left * scale_x);
+    rect.right = round(rect.right * scale_x);
+    rect.top = round(rect.top * scale_y);
+    rect.bottom = round(rect.bottom * scale_y);
+    return rect;
+}
+
+static RECT wayland_surface_get_child_bounds(struct wayland_surface *surface)
+{
+    const struct wayland_window_config *window = &surface->window;
+    RECT rect = {0, 0, window->client_rect.right - window->client_rect.left,
+                       window->client_rect.bottom - window->client_rect.top};
+
+    if (window->virtual_size.cx && window->virtual_size.cy)
+    {
+        rect.right = window->virtual_size.cx;
+        rect.bottom = window->virtual_size.cy;
+    }
+    return rect;
+}
+
+static void wayland_surface_map_child_geometry(struct wayland_surface *surface, RECT rect,
+                                                int *x, int *y, int *width, int *height)
+{
+    if (!surface->window.virtual_size.cx || !surface->window.virtual_size.cy)
+    {
+        /* Preserve ordinary presentation's position/size rounding. */
+        wayland_surface_coords_from_window(surface, rect.left, rect.top, x, y);
+        wayland_surface_coords_from_window(surface, rect.right - rect.left,
+                                           rect.bottom - rect.top, width, height);
+        return;
+    }
+
+    rect = wayland_surface_map_child_rect(surface, rect);
+    *x = rect.left;
+    *y = rect.top;
+    *width = rect.right - rect.left;
+    *height = rect.bottom - rect.top;
+}
+
 static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
                                                struct wayland_client_surface *client,
                                                const RECT *client_rect,
@@ -3630,7 +3693,10 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
     /* The offset of the client area origin relatively to the window origin. */
     OffsetRect(&rect, window->client_rect.left - window->rect.left,
                window->client_rect.top - window->rect.top);
-    rect = map_rect_to_surface(surface, rect);
+    if (client->client.hwnd == surface->hwnd)
+        rect = map_rect_to_surface(surface, rect);
+    else
+        rect = wayland_surface_map_child_rect(surface, rect);
 
     TRACE("hwnd=%p rect=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
 
@@ -3907,10 +3973,18 @@ static BOOL wayland_hwnd_dmabuf_surface_compute_geometry(struct wayland_surface 
         int height = parent->window.rect.bottom - parent->window.rect.top;
 
         if (width <= 0 || height <= 0) return FALSE;
-        geometry->source_x = 0;
-        geometry->source_y = 0;
-        geometry->source_width = max(1, min(width, surface->current->width));
-        geometry->source_height = max(1, min(height, surface->current->height));
+        SetRect(&rect, 0, 0, width, height);
+        /* Overlay pixels share the parent's logical SHM crop, not its presentation size. */
+        if (parent->window.virtual_size.cx && parent->window.virtual_size.cy)
+            rect = parent->window.shm_source;
+        rect.left = max(0, min(rect.left, surface->current->width - 1));
+        rect.top = max(0, min(rect.top, surface->current->height - 1));
+        rect.right = max(rect.left + 1, min(rect.right, surface->current->width));
+        rect.bottom = max(rect.top + 1, min(rect.bottom, surface->current->height));
+        geometry->source_x = rect.left;
+        geometry->source_y = rect.top;
+        geometry->source_width = rect.right - rect.left;
+        geometry->source_height = rect.bottom - rect.top;
         wayland_surface_coords_from_window(parent, 0, 0, &geometry->x, &geometry->y);
         wayland_surface_coords_from_window(parent, width, height,
                                            &geometry->width, &geometry->height);
@@ -3923,9 +3997,7 @@ static BOOL wayland_hwnd_dmabuf_surface_compute_geometry(struct wayland_surface 
     rect_height = rect.bottom - rect.top;
     if (rect_width <= 0 || rect_height <= 0) return FALSE;
 
-    client.left = client.top = 0;
-    client.right = parent->window.client_rect.right - parent->window.client_rect.left;
-    client.bottom = parent->window.client_rect.bottom - parent->window.client_rect.top;
+    client = wayland_surface_get_child_bounds(parent);
 
     clipped.left = max(rect.left, client.left);
     clipped.top = max(rect.top, client.top);
@@ -3973,10 +4045,7 @@ static BOOL wayland_hwnd_dmabuf_surface_compute_geometry(struct wayland_surface 
         }
     }
 
-    wayland_surface_coords_from_window(parent, dst.left, dst.top,
-                                       &geometry->x, &geometry->y);
-    wayland_surface_coords_from_window(parent, dst.right - dst.left,
-                                       dst.bottom - dst.top,
+    wayland_surface_map_child_geometry(parent, dst, &geometry->x, &geometry->y,
                                        &geometry->width, &geometry->height);
     geometry->width = max(1, geometry->width);
     geometry->height = max(1, geometry->height);
@@ -4233,9 +4302,7 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
     child_height = child_rect.bottom - child_rect.top;
     if (child_width <= 0 || child_height <= 0) return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
 
-    client.left = client.top = 0;
-    client.right = parent->window.client_rect.right - parent->window.client_rect.left;
-    client.bottom = parent->window.client_rect.bottom - parent->window.client_rect.top;
+    client = wayland_surface_get_child_bounds(parent);
 
     clipped.left = max(child_rect.left, client.left);
     clipped.top = max(child_rect.top, client.top);
@@ -4297,10 +4364,7 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
         sw = (double)(source_rect.right - source_rect.left) * buffer->width / child_width;
         sh = (double)(source_rect.bottom - source_rect.top) * buffer->height / child_height;
 
-        wayland_surface_coords_from_window(parent, visible->left, visible->top,
-                                           &layout[i].x, &layout[i].y);
-        wayland_surface_coords_from_window(parent, visible->right - visible->left,
-                                           visible->bottom - visible->top,
+        wayland_surface_map_child_geometry(parent, *visible, &layout[i].x, &layout[i].y,
                                            &layout[i].width, &layout[i].height);
         layout[i].width = max(1, layout[i].width);
         layout[i].height = max(1, layout[i].height);
@@ -6541,7 +6605,8 @@ static void wayland_surface_get_input_transform(struct wayland_surface *surface,
     fullscreen = data && wayland_win_data_get_fullscreen_rect(data, TRUE,
                                                               &fullscreen_rect);
     if (data && !IsRectEmpty(&data->rects.client) &&
-        (fullscreen || data->has_present_rect))
+        (fullscreen || data->has_present_rect ||
+         (surface->window.virtual_size.cx && surface->window.virtual_size.cy)))
     {
         /* Input remains in HWND client space while the present rectangle controls display. */
         transform->screen = data->rects.client;

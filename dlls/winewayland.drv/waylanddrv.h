@@ -523,6 +523,8 @@ struct wayland_window_config
     RECT client_rect;
     /* Window-surface buffer pixels presented by the parent wl_surface. */
     RECT shm_source;
+    /* Logical client extent stretched by virtual-desktop presentation, or zero. */
+    SIZE virtual_size;
     enum wayland_surface_config_state state;
     /* The scale (i.e., normalized dpi) the window is rendering at. */
     double scale;
@@ -747,6 +749,7 @@ void wayland_output_use_image_description(struct wayland_output *output);
 struct wayland_output *wayland_output_for_rect(const RECT *rect, RECT *output_rect,
                                                double *output_scale);
 BOOL wayland_output_get_layout_rect(const struct wl_output *wl_output, RECT *rect);
+BOOL wayland_output_get_primary_rect(RECT *rect);
 BOOL wayland_output_layout_intersects_rect(const RECT *rect);
 void output_info_array_update(void);
 BOOL wayland_output_edid_is_valid(const unsigned char *edid, UINT edid_len);
@@ -963,6 +966,7 @@ struct wayland_win_data
     struct wayland_client_surface *stashed_client;
     /* window rects, relative to parent client area */
     struct window_rects rects;
+    BOOL virtual_desktop;
     BOOL is_fullscreen;
     BOOL has_present_rect;
     RECT present_rect;

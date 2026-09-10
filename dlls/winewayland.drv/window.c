@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -103,6 +104,8 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
 {
     struct wayland_win_data *data;
     struct rb_entry *rb_entry;
+    USEROBJECTFLAGS desktop_flags;
+    HDESK desktop;
     HWND parent;
 
     /* Don't create win data for desktop or HWND_MESSAGE windows. */
@@ -113,6 +116,10 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
     if (!(data = calloc(1, sizeof(*data)))) return NULL;
 
     data->hwnd = hwnd;
+    /* A window remains on its owning thread's desktop for its lifetime. */
+    desktop = NtUserGetThreadDesktop(NtUserGetWindowThread(hwnd, NULL));
+    if (NtUserGetObjectInformation(desktop, UOI_FLAGS, &desktop_flags, sizeof(desktop_flags), NULL))
+        data->virtual_desktop = !!(desktop_flags.dwFlags & DF_WINE_VIRTUAL_DESKTOP);
     data->toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     data->owner = NtUserGetWindowRelative(hwnd, GW_OWNER);
     data->window_text = get_window_text(hwnd);
@@ -339,12 +346,27 @@ done:
 BOOL wayland_win_data_get_fullscreen_rect(const struct wayland_win_data *data,
                                           BOOL active, RECT *rect)
 {
+    struct wayland_surface *surface = data->wayland_surface;
+
     if (data->client_surface &&
         wayland_client_surface_get_fullscreen_rect(data->client_surface, active, rect))
         return TRUE;
-    if (!data->application_fullscreen) return FALSE;
-    *rect = data->application_fullscreen_rect;
-    return TRUE;
+    if (!data->virtual_desktop || !data->is_fullscreen ||
+        !wayland_window_style_allows_fullscreen(data->style))
+    {
+        if (!data->application_fullscreen) return FALSE;
+        *rect = data->application_fullscreen_rect;
+        return TRUE;
+    }
+
+    /* Virtual desktop coordinates do not identify a physical output. Present
+     * without resizing Win32 geometry, keeping an existing fullscreen target
+     * or starting on the configured primary output. */
+    if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
+        surface->fullscreen_requested &&
+        wayland_output_get_layout_rect(surface->requested_output, rect))
+        return TRUE;
+    return wayland_output_get_primary_rect(rect);
 }
 
 BOOL wayland_win_data_get_presentation_rect(const struct wayland_win_data *data,
@@ -382,7 +404,7 @@ static BOOL wayland_win_data_has_fixed_fullscreen_size(const struct wayland_win_
 {
     RECT rect;
 
-    return data->has_present_rect ||
+    return data->virtual_desktop || data->has_present_rect ||
            (data->client_surface &&
             wayland_client_surface_get_fullscreen_rect(data->client_surface, TRUE, &rect));
 }
@@ -443,7 +465,8 @@ BOOL wayland_win_data_covers_virtual_screen(const struct wayland_win_data *data)
     RECT intersection, virtual_screen = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
     RECT rect = data->rects.client;
 
-    wayland_win_data_get_presentation_rect(data, TRUE, &rect);
+    if (!data->virtual_desktop)
+        wayland_win_data_get_presentation_rect(data, TRUE, &rect);
 
     intersect_rect(&intersection, &rect, &virtual_screen);
     return EqualRect(&intersection, &virtual_screen);
@@ -463,9 +486,28 @@ static RECT wayland_win_data_get_shm_source(const struct wayland_win_data *data,
     return source;
 }
 
+static RECT map_virtual_overlay_rect(const struct wayland_win_data *data,
+                                      const struct wayland_window_config *parent, RECT rect)
+{
+    double scale_x = (double)(parent->client_rect.right - parent->client_rect.left) /
+                    parent->virtual_size.cx;
+    double scale_y = (double)(parent->client_rect.bottom - parent->client_rect.top) /
+                    parent->virtual_size.cy;
+
+    OffsetRect(&rect, data->client_rect_in_toplevel.left - data->rects.client.left,
+               data->client_rect_in_toplevel.top - data->rects.client.top);
+    rect.left = parent->client_rect.left + round(rect.left * scale_x);
+    rect.right = parent->client_rect.left + round(rect.right * scale_x);
+    rect.top = parent->client_rect.top + round(rect.top * scale_y);
+    rect.bottom = parent->client_rect.top + round(rect.bottom * scale_y);
+    return rect;
+}
+
 static void wayland_win_data_get_config(struct wayland_win_data *data,
                                         struct wayland_window_config *conf)
 {
+    struct wayland_win_data *owner;
+    const struct wayland_window_config *parent = NULL;
     enum wayland_surface_config_state window_state = 0;
     DWORD style = data->style, exstyle = data->exstyle;
     RECT presentation_rect, fullscreen_rect;
@@ -474,6 +516,11 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     BOOL application_fullscreen =
         wayland_win_data_get_fullscreen_rect(data, TRUE, &fullscreen_rect);
     BOOL fullscreen = wayland_win_data_is_fullscreen(data);
+
+    if (data->virtual_desktop && data->overlay_owner && data->client_rect_in_toplevel_valid &&
+        (owner = wayland_win_data_get_nolock(data->overlay_owner)) && owner->wayland_surface &&
+        owner->wayland_surface->window.virtual_size.cx && owner->wayland_surface->window.virtual_size.cy)
+        parent = &owner->wayland_surface->window;
 
     conf->minimized = style & WS_MINIMIZE;
     /* The Win32 iconic rect is not compositor geometry. */
@@ -484,6 +531,14 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
             conf->rect = data->restore_rect;
             conf->window_rect = data->restore_rect;
             conf->client_rect = data->restore_rect;
+        }
+        else if (parent)
+        {
+            /* Owned panels share their owner's presentation transform, including
+             * panels that in turn host windows from another process. */
+            conf->rect = map_virtual_overlay_rect(data, parent, data->rects.visible);
+            conf->window_rect = map_virtual_overlay_rect(data, parent, data->rects.window);
+            conf->client_rect = map_virtual_overlay_rect(data, parent, data->rects.client);
         }
         else if (has_presentation_rect)
         {
@@ -499,7 +554,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
         }
 
         /* Keep framed fullscreen extents out of the Wayland geometry. */
-        if (!conf->minimized && !has_presentation_rect && fullscreen &&
+        if (!conf->minimized && !parent && !has_presentation_rect && fullscreen &&
             (style & (WS_CAPTION | WS_THICKFRAME)))
         {
             conf->rect = data->rects.client;
@@ -534,6 +589,14 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     conf->state = window_state;
     conf->managed = data->managed;
     conf->preserve_fullscreen_size = wayland_win_data_has_fixed_fullscreen_size(data);
+    conf->virtual_size.cx = conf->virtual_size.cy = 0;
+    if (data->virtual_desktop && !conf->minimized &&
+        (parent || (has_presentation_rect && (window_state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))) &&
+        !IsRectEmpty(&data->rects.client))
+    {
+        conf->virtual_size.cx = data->rects.client.right - data->rects.client.left;
+        conf->virtual_size.cy = data->rects.client.bottom - data->rects.client.top;
+    }
 }
 
 static void reapply_cursor_clipping(void)
@@ -679,7 +742,15 @@ static void refresh_owned_overlays(HWND owner, BOOL wake_unbound)
                                         &data->client_rect_in_toplevel);
         surface = data->wayland_surface;
         if (surface && surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
+        {
+            if (data->virtual_desktop) wayland_win_data_get_config(data, &surface->window);
             wayland_surface_reconfigure(surface);
+            if (data->virtual_desktop)
+            {
+                wayland_surface_commit_pending_state(surface);
+                refresh_owned_overlays(data->hwnd, FALSE);
+            }
+        }
         else if (wake_unbound)
             NtUserPostMessage(data->hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
     }
@@ -1018,6 +1089,11 @@ void wayland_win_data_refresh_fullscreen(struct wayland_win_data *data)
     if (!data->wayland_surface) return;
     wayland_win_data_get_config(data, &data->wayland_surface->window);
     wayland_win_data_update_wayland_state(data);
+    if (data->virtual_desktop)
+    {
+        refresh_owned_overlays(data->hwnd, FALSE);
+        wl_display_flush(process_wayland.wl_display);
+    }
 }
 
 static BOOL is_managed(HWND hwnd)
@@ -1644,8 +1720,8 @@ static void wayland_configure_window(HWND hwnd)
         flags |= SWP_FRAMECHANGED;
     }
 
-    /* Explicit presentation modes own their render extent. Ordinary xdg
-     * fullscreen follows the compositor extent and reaches Win32 as a resize. */
+    /* Explicit presentation modes and virtual desktops own their render extent.
+     * Ordinary xdg fullscreen follows the compositor extent as a Win32 resize. */
     if (wayland_win_data_has_fixed_fullscreen_size(data) &&
         (surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
         (surface->window.state & managed_state) == (state & managed_state))
@@ -1659,7 +1735,7 @@ static void wayland_configure_window(HWND hwnd)
     flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
     if (window_width == 0 || window_height == 0) flags |= SWP_NOSIZE;
     rect = wayland_win_data_configure_window_rect(data, window_width, window_height);
-    if ((state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+    if (!data->virtual_desktop && (state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
         surface->fullscreen_requested &&
         wayland_output_get_layout_rect(surface->requested_output, &output_rect))
     {
