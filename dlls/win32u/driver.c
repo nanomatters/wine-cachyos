@@ -1479,7 +1479,7 @@ UINT WINAPI __wine_get_display_backend(void)
         backend |= client_surface_query_display_feedback()
                    << WINE_DISPLAY_FEEDBACK_PRESENTATION_SHIFT;
 
-    return backend;
+    return backend | get_hud_display_feedback();
 }
 
 /******************************************************************************

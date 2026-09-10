@@ -31,6 +31,7 @@
 #endif
 
 #include <sys/prctl.h>
+#include <pthread.h>
 #include <string.h>
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -42,6 +43,47 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 WINE_DECLARE_DEBUG_CHANNEL(keyboard);
+
+static LONG hud_display_feedback;
+static BOOL hud_toggle_enabled;
+static pthread_once_t hud_toggle_once = PTHREAD_ONCE_INIT;
+
+static void init_hud_toggle(void)
+{
+    const char *config = getenv( "DXVK_HUD" );
+
+    hud_toggle_enabled = config && *config && strcmp( config, "0" );
+}
+
+UINT get_hud_display_feedback(void)
+{
+    return InterlockedCompareExchange( &hud_display_feedback, 0, 0 );
+}
+
+void process_hud_key( UINT vkey, DWORD flags )
+{
+    const desktop_shm_t *desktop_shm;
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    NTSTATUS status;
+    BOOL toggle = FALSE;
+
+    if (vkey != 'O' || (flags & (KEYEVENTF_KEYUP | KEYEVENTF_UNICODE))) return;
+    pthread_once( &hud_toggle_once, init_hud_toggle );
+    if (!hud_toggle_enabled) return;
+
+    /* Read the state before this event, without pumping events or polling keys.
+     * An already-held O is a repeat, not another toggle. Leave input delivery alone. */
+    while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
+        toggle = !(desktop_shm->keystate['O'] & 0x80) &&
+                 (desktop_shm->keystate[VK_CONTROL] & 0x80) &&
+                 (desktop_shm->keystate[VK_SHIFT] & 0x80) &&
+                 !(desktop_shm->keystate[VK_MENU] & 0x80) &&
+                 !(desktop_shm->keystate[VK_LWIN] & 0x80) &&
+                 !(desktop_shm->keystate[VK_RWIN] & 0x80);
+
+    if (!status && toggle)
+        InterlockedXor( &hud_display_feedback, WINE_DISPLAY_FEEDBACK_HUD_HIDDEN );
+}
 
 static const WCHAR keyboard_layouts_keyW[] =
 {

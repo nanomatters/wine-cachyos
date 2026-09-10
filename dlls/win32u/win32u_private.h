@@ -88,6 +88,8 @@ extern BOOL register_imm_window( HWND hwnd );
 extern void unregister_imm_window( HWND hwnd );
 
 /* input.c */
+extern UINT get_hud_display_feedback(void);
+extern void process_hud_key( UINT vkey, DWORD flags );
 extern BOOL enable_mouse_in_pointer;
 extern BOOL grab_pointer;
 extern BOOL grab_fullscreen;

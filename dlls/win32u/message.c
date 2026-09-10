@@ -4020,6 +4020,8 @@ NTSTATUS send_hardware_message( HWND hwnd, UINT flags, const INPUT *input, LPARA
                 req->input.kbd.scan = scan & 0xff;
                 req->input.kbd.flags &= ~KEYEVENTF_SCANCODE;
             }
+            if (!(flags & SEND_HWMSG_INJECTED))
+                process_hud_key( req->input.kbd.vkey, req->input.kbd.flags );
             break;
         case INPUT_HARDWARE:
             req->input.hw.msg    = input->hi.uMsg;
