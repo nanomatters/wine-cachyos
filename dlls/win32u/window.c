@@ -2409,41 +2409,50 @@ static NTSTATUS get_window_region( HWND hwnd, enum window_region_type type, HRGN
 static void update_surface_region( HWND hwnd )
 {
     WND *win = get_win_ptr( hwnd );
+    struct window_surface *surface;
     HRGN region, shape = 0;
     HWND surface_producer = 0;
+    DWORD ex_style;
     RECT visible;
 
     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
-    if (!win->surface) goto done;
+    if ((surface = win->surface)) window_surface_add_ref( surface );
+    ex_style = win->dwExStyle;
+    release_win_ptr( win );
+    if (!surface) return;
+
+    /* Region setters can flush the driver. Keep the surface alive without
+     * holding the USER lock while entering the driver's window-data lock. */
+    user_check_not_lock();
 
     if (get_window_region( hwnd, WINDOW_REGION_SHAPE, &shape, &visible, NULL ))
     {
-        window_surface_clear_clip_producer( win->surface );
+        window_surface_clear_clip_producer( surface );
         goto done;
     }
     if (shape)
     {
         region = NtGdiCreateRectRgn( 0, 0, visible.right - visible.left, visible.bottom - visible.top );
         NtGdiCombineRgn( shape, shape, region, RGN_AND );
-        if (win->dwExStyle & WS_EX_LAYOUTRTL) NtUserMirrorRgn( hwnd, shape );
+        if (ex_style & WS_EX_LAYOUTRTL) NtUserMirrorRgn( hwnd, shape );
         NtGdiDeleteObjectApp( region );
     }
-    window_surface_set_shape( win->surface, shape );
+    window_surface_set_shape( surface, shape );
 
     if (get_window_region( hwnd, WINDOW_REGION_SURFACE, &region, &visible,
                            &surface_producer ))
     {
-        window_surface_clear_clip_producer( win->surface );
+        window_surface_clear_clip_producer( surface );
         goto done;
     }
-    if (!region) window_surface_set_clip( win->surface, shape, surface_producer );
+    if (!region) window_surface_set_clip( surface, shape, surface_producer );
     else
     {
         if (NtGdiOffsetRgn( region, -visible.left, -visible.top ) == ERROR)
             surface_producer = 0;
         if (shape && NtGdiCombineRgn( region, region, shape, RGN_AND ) == ERROR)
             surface_producer = 0;
-        window_surface_set_clip( win->surface, region, surface_producer );
+        window_surface_set_clip( surface, region, surface_producer );
         NtGdiDeleteObjectApp( region );
     }
 
@@ -2453,14 +2462,14 @@ static void update_surface_region( HWND hwnd )
     {
         NtGdiOffsetRgn( region, -visible.left, -visible.top );
         if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
-        window_surface_set_gdi_over_producer_region( win->surface, region );
+        window_surface_set_gdi_over_producer_region( surface, region );
         NtGdiDeleteObjectApp( region );
     }
-    else window_surface_set_gdi_over_producer_region( win->surface, 0 );
+    else window_surface_set_gdi_over_producer_region( surface, 0 );
 
 done:
     if (shape) NtGdiDeleteObjectApp( shape );
-    release_win_ptr( win );
+    window_surface_release( surface );
 }
 
 
@@ -2817,7 +2826,6 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     if (ret)
     {
-        update_surface_region( surface_win );
         if (((swp_flags & SWP_AGG_NOPOSCHANGE) != SWP_AGG_NOPOSCHANGE) ||
             (swp_flags & (SWP_HIDEWINDOW | SWP_SHOWWINDOW | SWP_STATECHANGED | SWP_FRAMECHANGED)))
             invalidate_dce( win, &old_rects.window );
@@ -2860,6 +2868,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     if (ret)
     {
+        update_surface_region( surface_win );
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
         register_window_surface( old_surface, new_surface );
         if (old_surface)
