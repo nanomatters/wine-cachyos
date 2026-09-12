@@ -7545,6 +7545,7 @@ static const char *wayland_surface_check_direct_eligibility(struct wayland_win_d
     if (!wayland_surface_is_toplevel(surface)) return "surface is not a live toplevel";
     if (surface->window.minimized) return "the toplevel is minimized";
     if (!wayland_surface_reconfigure(surface)) return "the toplevel is not ready for a buffer";
+    if (data->content_over_producer) return "GDI content overlaps the client surface";
     if (data->client_surface != expected_client)
         return expected_client ? "the window has a different client surface"
                                : "another client surface is attached";
@@ -7594,6 +7595,7 @@ static const char *wayland_client_surface_direct_toplevel_failure(
     else if (data->client_surface != surface) failure = "the window has a different client surface";
     else if (toplevel->direct_client != surface) failure = "the toplevel has a different direct client";
     else if (toplevel->shaped) failure = "the window is shaped";
+    else if (data->content_over_producer) failure = "GDI content overlaps the client surface";
     /* Hidden and iconic window rectangles are not presentation geometry. */
     else if (data->visible && !application_fullscreen && !toplevel->window.minimized &&
              !wayland_surface_client_fills_window(toplevel))
