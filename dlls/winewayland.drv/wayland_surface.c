@@ -2816,13 +2816,27 @@ void wayland_surface_commit(struct wayland_surface *surface)
 
 void wayland_surface_commit_pending_state(struct wayland_surface *surface)
 {
-    /* An invalidated WSI keeps its root buffer but no longer blocks parent
-     * state needed to latch a replacement subsurface. */
-    if (!surface->wl_surface ||
-        (wayland_surface_has_external_commit_owner(surface) &&
-         !ReadAcquire(&surface->direct_client->direct_toplevel_invalidated)) ||
-        !InterlockedExchange(&surface->pending_commit, FALSE))
-        return;
+    if (!surface->wl_surface || !ReadAcquire(&surface->pending_commit)) return;
+    if (wayland_surface_has_external_commit_owner(surface))
+    {
+        struct client_surface *client = &surface->direct_client->client;
+        BOOL wait;
+
+        if (!ReadAcquire(&surface->direct_client->direct_toplevel_invalidated)) return;
+
+        /* Invalidation rejects new presents, but an already registered host
+         * call may still be between setting sync points and attaching its
+         * buffer. Keep our pending state until that call has committed. */
+        pthread_mutex_lock(&client->presentation_mutex);
+        wait = client->presentation_wait_count != 0;
+        if (wait) client->presentation_update_pending = TRUE;
+        pthread_mutex_unlock(&client->presentation_mutex);
+        if (wait) return;
+    }
+
+    /* Once drained, the invalidated WSI's last buffer can latch the parent
+     * state needed by a replacement subsurface. */
+    if (!InterlockedExchange(&surface->pending_commit, FALSE)) return;
     wl_surface_commit(surface->wl_surface);
 }
 

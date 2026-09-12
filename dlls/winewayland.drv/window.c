@@ -1081,6 +1081,9 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
         break;
     }
 
+    /* Also retry parent state deferred until an invalidated host present ends. */
+    if (wayland_surface_has_external_commit_owner(surface))
+        wayland_surface_commit_pending_state(surface);
     wl_display_flush(process_wayland.wl_display);
 }
 
