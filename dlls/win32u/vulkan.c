@@ -7033,6 +7033,14 @@ static VkResult repack_present_pnext( struct mempool *pool, VkPresentInfoKHR *ho
     return VK_SUCCESS;
 }
 
+static void end_host_present_waits( struct swapchain **swapchains, const uint32_t *indices,
+                                    uint32_t *count )
+{
+    for (uint32_t i = 0; i < *count; i++)
+        client_surface_end_present_wait( swapchains[indices[i]]->surface->client );
+    *count = 0;
+}
+
 static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
 {
     VkPresentInfoKHR present_info_data = *client_present_info;
@@ -7056,7 +7064,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     const VkPresentId2KHR *present_id2_info =
         win32u_vk_find_struct( present_info, PRESENT_ID_2_KHR );
     struct wine_managed_swapchain *first_managed = NULL;
-    uint32_t host_count = 0;
+    uint32_t host_count = 0, host_wait_count = 0;
     BOOL skip_managed = FALSE;
     BOOL managed_present_waits_consumed = FALSE;
     BOOL present_waits_submitted = FALSE;
@@ -7170,6 +7178,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         host_indices[host_count] = i;
         host_count++;
     }
+    host_wait_count = host_count;
 
     /* Finish all host-present allocation and repacking before an internal
      * blit submission consumes the application's wait semaphores. */
@@ -7292,6 +7301,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         for (uint32_t i = 0; i < host_count; i++)
             present_results[host_indices[i]] =
                 present_result_was_enqueued( host_res ) ? host_results[i] : host_res;
+
+        /* The host has finished attaching and committing its buffers. Release
+         * topology pins before callbacks take window locks: a window thread
+         * may hold those locks while draining an orphaned direct presenter. */
+        end_host_present_waits( present_swapchains, host_indices, &host_wait_count );
         for (uint32_t i = 0; i < host_count; i++)
             if (presentation_feedbacks[i])
                 client_surface_finish_presentation_feedback(
@@ -7489,12 +7503,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     }
 
 failed:
-    for (uint32_t i = 0; i < host_count; i++)
-    {
-        struct swapchain *swapchain = present_swapchains[host_indices[i]];
-
-        client_surface_end_present_wait( swapchain->surface->client );
-    }
+    end_host_present_waits( present_swapchains, host_indices, &host_wait_count );
     mem_free( &pool );
     return res;
 }

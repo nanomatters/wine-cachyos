@@ -501,6 +501,17 @@ void client_surface_add_ref( struct client_surface *surface )
 
 void client_surface_release( struct client_surface *surface )
 {
+    LONG ref = ReadAcquire( &surface->ref ), prev;
+
+    /* Feedback preparation may release a shared reference while a native
+     * present is pinned. Do not wait for window callbacks under surfaces_lock
+     * when those callbacks may themselves be draining that present. */
+    while (ref > 1)
+    {
+        if ((prev = InterlockedCompareExchange( &surface->ref, ref - 1, ref )) == ref) return;
+        ref = prev;
+    }
+
     /* Detach and destroy callbacks run under surfaces_lock. Driver code must
      * not call this while holding a lock acquired by either callback. */
     pthread_mutex_lock( &surfaces_lock );
