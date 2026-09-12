@@ -204,12 +204,17 @@ static VkResult wayland_vulkan_surface_update(HWND hwnd, const struct vulkan_ins
         return VK_SUCCESS;
     }
 
-    if (client_surface_prepare_presentation_retirement(client)) return VK_NOT_READY;
+    if (client_surface_prepare_presentation_retirement(client))
+    {
+        wayland_client_surface_cancel_direct_promotion(client, hwnd);
+        return VK_NOT_READY;
+    }
 
     res = wayland_vulkan_create_host_surface(instance, toplevel_wl_surface, host_surface);
     if (res != VK_SUCCESS)
     {
         WARN("Failed to create promoted vulkan wayland surface, res=%d\n", res);
+        wayland_client_surface_cancel_direct_promotion(client, hwnd);
         client_surface_complete_presentation_retirement(client);
         return res;
     }
@@ -220,6 +225,7 @@ static VkResult wayland_vulkan_surface_update(HWND hwnd, const struct vulkan_ins
         TRACE("direct toplevel promotion aborted for hwnd=%p: %s\n", hwnd, reason);
         instance->p_vkDestroySurfaceKHR(instance->host.instance, *host_surface, NULL /* allocator */);
         *host_surface = VK_NULL_HANDLE;
+        wayland_client_surface_cancel_direct_promotion(client, hwnd);
         client_surface_complete_presentation_retirement(client);
         return VK_ERROR_OUT_OF_DATE_KHR;
     }

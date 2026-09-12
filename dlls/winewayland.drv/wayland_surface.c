@@ -7608,9 +7608,9 @@ static const char *wayland_client_surface_direct_toplevel_failure(
     return failure;
 }
 
-/* First phase of promoting an existing child-subsurface client to a borrowed
- * toplevel: validate eligibility and return the toplevel wl_surface the host
- * WSI surface should be created against, without mutating any state. */
+/* Reserve the toplevel while the host WSI surface is created without the win
+ * data lock. Eviction transfers the reserved wl_surface to the client, just
+ * as it does for a completed promotion. */
 struct wl_surface *wayland_client_surface_prepare_direct_promotion(struct client_surface *client,
                                                                    HWND hwnd, const char **reason)
 {
@@ -7638,7 +7638,7 @@ struct wl_surface *wayland_client_surface_prepare_direct_promotion(struct client
 
     if (ReadAcquire(&surface->direct_toplevel))
         failure = "already a direct toplevel";
-    else if (surface->direct_host_surface)
+    else if (surface->direct_host_surface || surface->direct_wl_surface)
         failure = "a previous direct host surface is still retiring";
     else
         failure = wayland_surface_check_direct_promotion(data, surface);
@@ -7649,11 +7649,30 @@ struct wl_surface *wayland_client_surface_prepare_direct_promotion(struct client
         /* Apply pending state before WSI takes ownership. */
         wayland_surface_commit(data->wayland_surface);
         wl_display_flush(process_wayland.wl_display);
+        surface->direct_wl_surface = toplevel_wl_surface;
+        data->wayland_surface->direct_client = surface;
     }
 
     wayland_win_data_release(data);
     *reason = failure;
     return toplevel_wl_surface;
+}
+
+/* The caller must destroy any temporary host VkSurfaceKHR before canceling. */
+void wayland_client_surface_cancel_direct_promotion(struct client_surface *client, HWND hwnd)
+{
+    struct wayland_client_surface *surface = impl_from_client_surface(client);
+    struct wayland_win_data *data;
+
+    wayland_win_data_lock();
+    data = wayland_win_data_get_nolock(hwnd);
+    if (data && data->wayland_surface && data->wayland_surface->direct_client == surface)
+        data->wayland_surface->direct_client = NULL;
+    if (surface->owns_direct_wl_surface)
+        wl_surface_destroy(surface->direct_wl_surface);
+    surface->direct_wl_surface = NULL;
+    surface->owns_direct_wl_surface = FALSE;
+    wayland_win_data_unlock();
 }
 
 /* Final phase of a direct-toplevel promotion, after the caller created the new

@@ -846,6 +846,7 @@ void wayland_surface_coords_to_window(struct wayland_surface *surface,
 struct wayland_client_surface *wayland_client_surface_create(HWND hwnd);
 struct wl_surface *wayland_client_surface_prepare_direct_promotion(struct client_surface *client,
                                                                    HWND hwnd, const char **reason);
+void wayland_client_surface_cancel_direct_promotion(struct client_surface *client, HWND hwnd);
 BOOL wayland_client_surface_finish_direct_promotion(struct client_surface *client, HWND hwnd,
                                                     struct wl_surface *toplevel_wl_surface,
                                                     UINT64 old_host_surface,
